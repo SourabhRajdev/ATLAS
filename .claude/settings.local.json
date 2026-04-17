@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /Users/sourabhrajdev/atlas/*.md)",
+      "Bash(rm -f AUTONOMY.md AUTONOMY_STATUS.md COMMANDS.md CONTINUITY.md EVOLUTION.md INTEGRATION.md JARVIS_COMPLETE.md PHASE_14_COMPLETE.md PHASE_15_COMPLETE.md PHASE_20_COMPLETE.md PHASE_9_10_COMPLETE.md PRESENCE.md QUICKSTART.md SOUR.md STATUS.md VOICE.md)",
+      "Bash(rm -f atlas/core/planner.py atlas/context/patterns.py)",
+      "Bash(rm -rf atlas/workflows)",
+      "Bash(rm -f atlas/context/__init__.py atlas/context/models.py atlas/context/tracker.py)",
+      "Bash(rmdir atlas/context)",
+      "Bash(python:*)",
+      "Bash(python3 -m py_compile atlas/core/executor.py)",
+      "Bash(python3 -m py_compile atlas/interfaces/cli.py)",
+      "Bash(python3 -m py_compile atlas/interfaces/voice.py)",
+      "Bash(python3 -m py_compile atlas/tools/browser.py)",
+      "Bash(python3 -m py_compile atlas/core/models.py)",
+      "Bash(python3 *)"
+    ]
+  }
+}
