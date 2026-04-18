@@ -158,6 +158,7 @@ async def _handle_command(
             "[bold]/undo[/bold]           — recent undo log\n"
             "[bold]/voice[/bold]          — push-to-talk voice input\n"
             "[bold]/voice continuous[/bold] — continuous voice mode\n"
+            "[bold]/status[/bold]         — all 8 system health checks\n"
             "[bold]/clear[/bold]          — clear screen\n"
             "[bold]/new[/bold]            — new session",
             title="Commands",
@@ -302,6 +303,62 @@ async def _handle_command(
                 import datetime
                 ts = datetime.datetime.fromtimestamp(t.created_at).strftime("%H:%M")
                 console.print(f"  [{ts}] {t.kind} via {t.backend} (id:{t.id})")
+
+    elif command == "/status":
+        try:
+            health = orch.system_health()
+        except Exception as e:
+            console.print(f"[danger]health_check failed: {e}[/danger]")
+            return None
+
+        table = Table(title="ATLAS System Health", border_style="blue")
+        table.add_column("System", style="bold cyan", width=18)
+        table.add_column("Status", width=10)
+        table.add_column("Details", style="dim")
+
+        STATUS_STYLE = {
+            "healthy":  "[bold green]healthy[/bold green]",
+            "degraded": "[bold yellow]degraded[/bold yellow]",
+            "down":     "[bold red]down[/bold red]",
+        }
+
+        def _fmt(h: dict, label: str) -> None:
+            st = h.get("status", "unknown")
+            styled = STATUS_STYLE.get(st, f"[white]{st}[/white]")
+            details_parts = []
+            for k, v in h.items():
+                if k == "status":
+                    continue
+                if isinstance(v, dict):
+                    continue
+                details_parts.append(f"{k}={v}")
+            table.add_row(label, styled, "  ".join(details_parts[:3]))
+
+        _fmt(health["trust"],       "Trust Layer")
+        _fmt(health["world_model"], "World Model")
+        _fmt(health["rag"],         "RAG (Production)")
+        _fmt(health["proactive"],   "Proactive Engine")
+
+        # Integrations — expand per-integration
+        int_health = health["integrations"]
+        int_status = int_health.get("status", "down")
+        int_styled = STATUS_STYLE.get(int_status, int_status)
+        int_details = "  ".join(
+            f"{name}={ih.get('status','?')}"
+            for name, ih in int_health.get("integrations", {}).items()
+        )
+        table.add_row("Integrations", int_styled, int_details)
+
+        _fmt(health["planning"],    "Planning")
+        _fmt(health["improvement"], "Self-Improvement")
+
+        ag_health = health["agents"]
+        ag_status = ag_health.get("status", "down")
+        ag_styled = STATUS_STYLE.get(ag_status, ag_status)
+        ag_details = f"agents={len(ag_health.get('agents', {}))}"
+        table.add_row("Multi-Agent", ag_styled, ag_details)
+
+        console.print(table)
 
     elif command == "/clear":
         console.clear()
