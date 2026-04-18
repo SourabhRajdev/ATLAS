@@ -1,3 +1,4 @@
+Copyright © 2026 Sourabh Rajdev. All Rights Reserved.
 <div align="center">
 
 ```
