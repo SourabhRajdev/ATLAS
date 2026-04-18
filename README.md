@@ -780,6 +780,6 @@ echo "All 337 tests passing."
 
 *ATLAS — Autonomous Task & Learning Agent System*
 
-*MIT License · Made with obsession on macOS*
+Copyright © 2026 Sourabh Rajdev. All Rights Reserved.
 
 </div>
