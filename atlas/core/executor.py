@@ -20,8 +20,20 @@ from atlas.core.models import Budget, Event, EventType, TaskState, Tier
 from atlas.core.approval import describe_action, needs_confirmation
 from atlas.tools.registry import ToolRegistry
 from atlas.memory.store import MemoryStore
+from atlas.trust import TrustLayer, TaintContext
 
 logger = logging.getLogger("atlas.executor")
+
+# Tools whose results contain external (untrusted) content.
+# After any of these execute, _current_taint is upgraded to EXTERNAL
+# so subsequent tool calls in the same loop inherit that taint level.
+_EXTERNAL_CONTENT_TOOLS: frozenset[str] = frozenset({
+    "web_search", "fetch_url",
+    "gmail_get_messages", "gmail_get_thread", "gmail_search",
+    "imessage_get_messages", "imessage_read",
+    "github_get_issues", "github_get_prs",   # issue/PR bodies are untrusted
+    "read_screen_text", "see_screen",         # screen content is untrusted
+})
 
 
 SYSTEM_PROMPT = """\
@@ -79,14 +91,18 @@ class Executor:
         config: Any,
         tools: ToolRegistry,
         memory: MemoryStore,
+        trust: TrustLayer | None = None,
     ) -> None:
         self.model_router = model_router
         self.config = config
         self.tools = tools
         self.memory = memory
+        self.trust = trust
         self.approval_callback: Callable | None = None
         self.notify_callback: Callable | None = None
         self.cancel_token: asyncio.Event | None = None
+        # Taint context for current request — updated per execution
+        self._current_taint: TaintContext = TaintContext.clean()
 
     # ------------------------------------------------------------------
     # Public entry point — async iterator of Events
@@ -102,6 +118,11 @@ class Executor:
     ) -> AsyncIterator[Event]:
         budget = budget or Budget.for_query(goal)
         state = TaskState(goal=goal, session_id=session_id)
+
+        # Reset taint to CLEAN at the start of each request.
+        # _execute_one() upgrades it if external-content tools are called.
+        self._current_taint = TaintContext.clean()
+        self._session_id = session_id
 
         state.messages = []
         if history:
@@ -259,11 +280,31 @@ class Executor:
         if not tool_def:
             return {"error": f"unknown tool: {name}"}
 
-        if needs_confirmation(tool_def, params):
+        # --- Trust gate (runs before confirmation, before execution) ---
+        if self.trust is not None:
+            decision = await self.trust.gate(
+                name, params, self._current_taint,
+                session_id=getattr(self, "_session_id", ""),
+            )
+            if not decision.allowed:
+                return {"error": f"trust: {decision.reason}"}
+            # Trust layer can escalate AUTO/NOTIFY tools to require confirmation
+            needs_trust_confirm = decision.requires_confirm
+        else:
+            needs_trust_confirm = False
+
+        if needs_confirmation(tool_def, params) or needs_trust_confirm:
             desc = describe_action(tool_def, params)
+            if needs_trust_confirm:
+                desc = f"[external-source escalation] {desc}"
             approved = await self._request_approval(desc)
             if not approved:
                 return {"error": "user denied"}
+
+        # Snapshot before execution for rollback support
+        snapshot_id: str | None = None
+        if self.trust is not None:
+            snapshot_id = await self.trust.snapshot_before(name, params)
 
         last_err = None
         for attempt in range(3):
@@ -283,7 +324,28 @@ class Executor:
                             await nr
                     except Exception:
                         pass
-                return {"result": str(record.result) if record.result is not None else ""}
+                result_str = str(record.result) if record.result is not None else ""
+
+                # Bug 1 fix: propagate taint from external-content tools.
+                # If this tool returned external content, all subsequent tool
+                # calls in this agent loop must treat that content as tainted.
+                if name in _EXTERNAL_CONTENT_TOOLS and result_str:
+                    self._current_taint = TaintContext.from_source(
+                        "tool_result", content=result_str
+                    )
+
+                if self.trust is not None and snapshot_id:
+                    # Record post-execution in audit (best effort)
+                    try:
+                        from atlas.trust.classifier import Decision as _D
+                        await self.trust.record_result(
+                            name, params, result_str,
+                            decision if self.trust else _D(True, "no trust", 0),
+                            session_id=getattr(self, "_session_id", ""),
+                        )
+                    except Exception:
+                        pass
+                return {"result": result_str, "_snapshot_id": snapshot_id or ""}
             except Exception as e:
                 last_err = str(e)
                 if attempt < 2 and _is_transient_err(last_err):

@@ -19,6 +19,7 @@ from atlas.core.model_router import build_model_router
 from atlas.core.models import Budget, EventType, Message, TaskState
 from atlas.memory.store import MemoryStore
 from atlas.tools.registry import ToolRegistry
+from atlas.trust import TrustLayer
 
 logger = logging.getLogger("atlas.engine")
 
@@ -36,11 +37,15 @@ class Engine:
         # ModelRouter: Gemini → Groq → Ollama failover
         self.model_router, self.client = build_model_router(config)
 
+        # Trust layer — separate DB from main atlas.db
+        self.trust = TrustLayer(db_path=config.data_dir / "trust.db")
+
         self.executor = Executor(
             model_router=self.model_router,
             config=config,
             tools=tools,
             memory=memory,
+            trust=self.trust,
         )
         self._session_history: dict[str, list[dict]] = {}
 
