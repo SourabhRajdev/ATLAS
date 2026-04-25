@@ -31,8 +31,11 @@ _EXTERNAL_CONTENT_TOOLS: frozenset[str] = frozenset({
     "web_search", "fetch_url",
     "gmail_get_messages", "gmail_get_thread", "gmail_search",
     "imessage_get_messages", "imessage_read",
-    "github_get_issues", "github_get_prs",   # issue/PR bodies are untrusted
-    "read_screen_text", "see_screen",         # screen content is untrusted
+    "github_get_issues", "github_get_prs", "github_get_commits",
+    "github_search_repos", "github_get_user",
+    "read_screen_text", "see_screen", "describe_screen",
+    "get_clipboard", "browser_extract_text",
+    "spotlight_search",
 })
 
 
@@ -103,6 +106,7 @@ class Executor:
         self.cancel_token: asyncio.Event | None = None
         # Taint context for current request — updated per execution
         self._current_taint: TaintContext = TaintContext.clean()
+        self._taint_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public entry point — async iterator of Events
@@ -330,9 +334,11 @@ class Executor:
                 # If this tool returned external content, all subsequent tool
                 # calls in this agent loop must treat that content as tainted.
                 if name in _EXTERNAL_CONTENT_TOOLS and result_str:
-                    self._current_taint = TaintContext.from_source(
+                    new_taint = TaintContext.from_source(
                         "tool_result", content=result_str
                     )
+                    async with self._taint_lock:
+                        self._current_taint = self._current_taint.merge(new_taint)
 
                 if self.trust is not None and snapshot_id:
                     # Record post-execution in audit (best effort)
