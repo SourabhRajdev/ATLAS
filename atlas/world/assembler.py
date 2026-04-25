@@ -105,10 +105,11 @@ class ContextAssembler:
                 )
                 days_ago = int((now - entity.last_updated) / 86_400)
                 contact_str = f"{days_ago}d ago" if days_ago > 0 else "today"
-                line = f"  {entity.name}"
-                if attr_str:
-                    line += f" — {attr_str}"
-                line += f", last contact {contact_str}"
+                line = (
+                    f"  {entity.name}"
+                    f"{f' — {attr_str}' if attr_str else ''}"
+                    f", last contact {contact_str}"
+                )
                 if not add_line(line):
                     truncated = True
                     break
@@ -122,11 +123,11 @@ class ContextAssembler:
                 status = attrs.get("status", "active")
                 completion = attrs.get("completion_pct", "?")
                 next_task = attrs.get("next_task", "")
-                line = f"  {entity.name} — {status}"
-                if completion != "?":
-                    line += f", {completion}% done"
-                if next_task:
-                    line += f", next: {next_task[:40]}"
+                line = (
+                    f"  {entity.name} — {status}"
+                    f"{f', {completion}% done' if completion != '?' else ''}"
+                    f"{f', next: {next_task[:40]}' if next_task else ''}"
+                )
                 if not add_line(line):
                     truncated = True
                     break
@@ -140,9 +141,7 @@ class ContextAssembler:
                 person = attrs.get("to_person", "someone")
                 thing = attrs.get("what", entity.name[:50])
                 due = attrs.get("due_date", "")
-                line = f"  You owe {person}: {thing}"
-                if due:
-                    line += f" by {due}"
+                line = f"  You owe {person}: {thing}{f' by {due}' if due else ''}"
                 if not add_line(line):
                     truncated = True
                     break
