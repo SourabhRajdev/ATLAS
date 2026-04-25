@@ -87,6 +87,22 @@ class TaintContext:
     def is_hostile(self) -> bool:
         return self.level == TaintLevel.HOSTILE
 
+    def merge(self, other: "TaintContext") -> "TaintContext":
+        """Merge another context into this one, keeping the highest level."""
+        if other.level > self.level:
+            new_level = other.level
+            new_source = other.source
+        else:
+            new_level = self.level
+            new_source = self.source
+
+        new_patterns = sorted(list(set(self.injection_patterns_found + other.injection_patterns_found)))
+        return TaintContext(
+            source=new_source,
+            level=new_level,
+            injection_patterns_found=new_patterns,
+        )
+
     def __str__(self) -> str:
         name = TaintLevel(self.level).name
         if self.injection_patterns_found:
