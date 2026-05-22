@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import subprocess
 from datetime import datetime, timezone
 
@@ -118,8 +119,8 @@ def register(registry: ToolRegistry) -> None:
 
         try:
             result = subprocess.run(
-                command,
-                shell=True,
+                shlex.split(command),
+                shell=False,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
