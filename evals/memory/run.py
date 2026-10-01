@@ -197,6 +197,10 @@ async def run_scenario(scenario: dict, provider_available: bool) -> dict:
                     )
                     memory.db.commit()
         finally:
+            # Drain before stopping the queue those background jobs run on,
+            # and before closing the stores they write into (atlas/core/
+            # orchestrator.py's stop() does the same, in the same order).
+            await orch.engine.drain_background_tasks()
             orch.engine.llm_queue.stop()
             memory.close()
             orch.world_model.close()

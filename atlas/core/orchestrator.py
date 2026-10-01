@@ -65,8 +65,12 @@ class Orchestrator:
         self.config = config
         self.memory = memory
 
+        # System 1: World Model — built before Engine so Engine can spawn
+        # background fact extraction into it (atlas/world/fact_extraction.py).
+        self.world_model = WorldModel(config.data_dir / "world.db")
+
         # Core
-        self.engine = Engine(config, memory, tools)
+        self.engine = Engine(config, memory, tools, world_model=self.world_model)
         self.router = ActionRouter(confirm_fn=self._default_confirm)
         self.command_router = CommandRouter()   # Tier-0: zero-LLM fast path
         self._tools = tools                     # needed for direct tool execution
@@ -104,9 +108,6 @@ class Orchestrator:
         )
 
         # ── New systems ────────────────────────────────────────────────────
-        # System 1: World Model
-        self.world_model = WorldModel(config.data_dir / "world.db")
-
         # System 5: Production RAG (uses same DB as memory store)
         self.rag = RAGRetriever(memory, self.world_model)
         self.rag_ingestion = IngestionPipeline(memory, self.world_model)
@@ -185,6 +186,10 @@ class Orchestrator:
         logger.info("orchestrator stopping")
         self.perception.stop()
         self.autonomy_loop.stop()
+        # Let in-flight background fact extraction finish before the queue
+        # that's running it gets torn down — draining after stop() would just
+        # be waiting on jobs stop() already cancelled mid-flight.
+        await self.engine.drain_background_tasks()
         self.engine.llm_queue.stop()
         for t in self._tasks.values():
             t.cancel()
