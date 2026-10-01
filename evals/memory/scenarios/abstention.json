@@ -1,0 +1,17 @@
+{
+  "name": "abstention",
+  "family": "abstention",
+  "description": "Asked about something never mentioned -> says it doesn't know, no hallucination. Hallucination can't be caught by a 'must not contain X' check since we don't know what it would fabricate, so this checks for the presence of abstention language instead.",
+  "sessions": [
+    {
+      "turns": [
+        {
+          "text": "What's my sister's birthday?",
+          "expect": {
+            "contains_any": ["don't know", "not sure", "no information", "haven't told", "haven't mentioned", "don't have that"]
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "recall_across_sessions",
+  "family": "recall",
+  "description": "A fact told in session 1 must be recallable in session 3, with no mention of it in between.",
+  "sessions": [
+    {"turns": ["My dentist appointment is Thursday at 3pm."]},
+    {"turns": ["What's the weather like today?"]},
+    {
+      "turns": [
+        {
+          "text": "What time is my dentist appointment?",
+          "expect": {
+            "contains_any": ["3pm", "3 pm", "3:00pm", "3:00 pm"],
+            "must_not_contain": ["don't know", "not sure", "no information", "haven't told", "didn't mention"]
+          }
+        }
+      ]
+    }
+  ]
+}

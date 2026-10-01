@@ -1,0 +1,26 @@
+{
+  "name": "update_supersession",
+  "family": "supersession",
+  "description": "A fact changes; the new value answers a current-state question, and the old value is still answerable as history. This is the exact case that exposed the attributes-table supersession bug documented in docs/decisions/001-context-engine-and-memory.md Step D.",
+  "sessions": [
+    {"turns": ["I live in Vellore."]},
+    {"turns": ["I just moved to Bangalore."]},
+    {
+      "turns": [
+        {
+          "text": "Where do I live now?",
+          "expect": {
+            "contains_any": ["Bangalore"],
+            "must_not_contain": ["Vellore"]
+          }
+        },
+        {
+          "text": "Where did I live before I moved?",
+          "expect": {
+            "contains_any": ["Vellore"]
+          }
+        }
+      ]
+    }
+  ]
+}
