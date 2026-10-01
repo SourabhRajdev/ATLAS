@@ -13,7 +13,7 @@ User input → `CommandRouter` (Tier-0 regex) → `Engine` → `Executor` agent 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[all]"
-for mod in core trust world rag proactive integrations planning improvement agents; do
+for mod in core trust world rag memory context proactive integrations planning improvement agents; do
   python -m atlas.$mod.tests || exit 1
 done
 atlas   # run the CLI

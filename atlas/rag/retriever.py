@@ -14,14 +14,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import struct
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger("atlas.rag.retriever")
-
-DIMS = 384
 
 # Decay constants per memory type
 _LAMBDA = {
@@ -78,14 +75,22 @@ class RAGRetriever:
 
         merged = _merge_results(t1, t2, t3, t4)
 
-        # Apply importance weighting
+        # Reciprocal Rank Fusion instead of a fixed weighted sum of raw scores.
+        # The old scheme added fts_score/semantic_score/temporal_score/
+        # relational_score directly — four numbers from different, mutually
+        # incomparable distributions (FTS rank-derived, cosine similarity,
+        # exponential decay, a hardcoded constant), so the "0.35/0.30/0.20/
+        # 0.15" weights were tuning noise, not a real calibration. RRF only
+        # needs each tier's own internal ranking, which is robust regardless
+        # of what scale a tier's raw score happens to live on.
+        rrf_scores = _reciprocal_rank_fusion([t1, t2, t3, t4])
+        now = time.time()
         for r in merged:
-            r.final_score = (
-                r.fts_score * 0.35
-                + r.semantic_score * 0.30
-                + r.temporal_score * 0.20
-                + r.relational_score * 0.15
-            ) * (0.5 + 0.5 * r.importance)
+            fused = rrf_scores.get(r.id, 0.0)
+            # Recency and importance as small multipliers AFTER fusion, not
+            # folded into it — a very recent, low-importance result shouldn't
+            # outrank a highly-ranked, important one just because of age.
+            r.final_score = fused * _recency_multiplier(r, now) * (0.5 + 0.5 * r.importance)
 
         merged.sort(key=lambda r: r.final_score, reverse=True)
         return merged[:limit]
@@ -147,40 +152,45 @@ class RAGRetriever:
         if not hasattr(self._mem, "semantic") or self._mem.semantic is None:
             return []
         sem = self._mem.semantic
-        q_vec_bytes = sem.encode(query)
-        if q_vec_bytes is None:
+
+        # Delegates to SemanticStore's NumPy in-RAM matrix search (one matmul,
+        # not a per-row Python cosine loop — see atlas/memory/semantic.py).
+        # Oversample (limit*3, same pattern tier3 already uses below) since we
+        # still filter by a minimum-similarity floor afterward — some of the
+        # raw top-N might fall under it.
+        #
+        # This also removes a scalability bug the old inline version had: it
+        # queried "... LIMIT 500" with no ORDER BY, so past 500 embeddings it
+        # silently searched an arbitrary (usually insertion-order) subset
+        # instead of the whole table. SemanticStore now searches everything.
+        raw = sem.search(query, source="memory", limit=limit * 3)
+        if not raw:
             return []
 
-        q_vec = struct.unpack(f"{DIMS}f", q_vec_bytes)
-        rows = self._db.execute(
-            "SELECT e.id, e.text, e.metadata, m.type, m.importance, m.created_at, "
-            "       e.vector, m.source "
-            "FROM embeddings e "
-            "LEFT JOIN memories m ON m.id = e.id "
-            "WHERE e.source = 'memory' LIMIT 500",
+        ids = [r["id"] for r in raw]
+        placeholders = ",".join("?" * len(ids))
+        meta_rows = self._db.execute(
+            f"SELECT id, type, importance, created_at, source FROM memories "
+            f"WHERE id IN ({placeholders})",
+            ids,
         ).fetchall()
+        meta_by_id = {row["id"]: row for row in meta_rows}
 
+        _MIN_SIMILARITY = 0.3  # same floor the old inline cosine loop used
         scored = []
-        for row in rows:
-            if not row["vector"]:
+        for r in raw:
+            if r["score"] <= _MIN_SIMILARITY:
                 continue
-            try:
-                r_vec = struct.unpack(f"{DIMS}f", row["vector"])
-            except struct.error:
-                continue
-            cos = _cosine(q_vec, r_vec)
-            if cos > 0.3:
-                rr = RankedResult(
-                    id=row["id"],
-                    content=row["text"],
-                    type=row["type"] or "general",
-                    source=row["source"] or "",
-                    created_at=str(row["created_at"] or ""),
-                    importance=float(row["importance"] or 0.5),
-                    semantic_score=cos,
-                )
-                scored.append(rr)
-        scored.sort(key=lambda r: r.semantic_score, reverse=True)
+            meta = meta_by_id.get(r["id"])
+            scored.append(RankedResult(
+                id=r["id"],
+                content=r["text"],
+                type=(meta["type"] if meta else None) or "general",
+                source=(meta["source"] if meta else r["source"]) or "",
+                created_at=str(meta["created_at"]) if meta else "",
+                importance=float(meta["importance"]) if meta else 0.5,
+                semantic_score=r["score"],
+            ))
         return scored[:limit]
 
     # ------------------------------------------------------------------
@@ -298,13 +308,48 @@ class RAGRetriever:
 # Helpers
 # ------------------------------------------------------------------
 
-def _cosine(a: tuple, b: tuple) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(x * x for x in b))
-    if mag_a == 0 or mag_b == 0:
-        return 0.0
-    return dot / (mag_a * mag_b)
+_RRF_K = 60  # standard choice; needs no per-corpus tuning
+
+
+def _reciprocal_rank_fusion(tier_lists: list[list[RankedResult]], k: int = _RRF_K) -> dict[str, float]:
+    """score(d) = sum over tiers d appears in of 1/(k + rank_in_that_tier).
+
+    Each tier list is assumed already sorted best-first (true for all 4
+    tiers here). Normalized by the maximum possible score (appearing 1st in
+    every tier) so the result stays in a 0-1-ish range comparable to the old
+    weighted-sum scheme — callers downstream (ContextBudgetManager's
+    MIN_SCORE drop threshold) depend on that range, and an unnormalized RRF
+    score is small enough (~0.016 for a single rank-1 hit, vs MIN_SCORE=0.05)
+    that it would silently drop results that used to survive.
+    """
+    raw: dict[str, float] = {}
+    for tier in tier_lists:
+        for rank, r in enumerate(tier, start=1):
+            raw[r.id] = raw.get(r.id, 0.0) + 1.0 / (k + rank)
+
+    max_possible = len(tier_lists) * (1.0 / (k + 1))
+    if max_possible <= 0:
+        return raw
+    return {doc_id: score / max_possible for doc_id, score in raw.items()}
+
+
+def _recency_multiplier(r: "RankedResult", now: float) -> float:
+    """Mild post-fusion recency boost — same per-type decay rates tier 3
+    already uses, but applied as a 0.7-1.0 multiplier (not a 0-1 score) so
+    an old-but-highly-ranked result isn't crushed just for being old."""
+    try:
+        s = r.created_at
+        if "T" in s or "+" in s:
+            from datetime import datetime
+            created_ts = datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        else:
+            created_ts = float(s)
+    except (ValueError, TypeError):
+        return 1.0  # unknown age — don't penalize
+    days_old = max(0.0, (now - created_ts) / 86_400)
+    lam = _LAMBDA.get(r.type, _LAMBDA["general"])
+    decay = math.exp(-lam * days_old)
+    return 0.7 + 0.3 * decay
 
 
 def _merge_results(

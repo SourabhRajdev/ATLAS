@@ -107,6 +107,34 @@ async def run_tests() -> None:
               all(all_results[i].final_score >= all_results[i+1].final_score
                   for i in range(len(all_results)-1)))
 
+        # ── Test 3b: Reciprocal Rank Fusion (Phase 1 Step E) ────────────────
+        print("\n[3b] Reciprocal Rank Fusion replacing the fixed weighted sum")
+
+        from atlas.rag.retriever import RankedResult, _reciprocal_rank_fusion, _recency_multiplier
+
+        tier_a = [
+            RankedResult(id="x", content="", type="general", source="", created_at=""),
+            RankedResult(id="y", content="", type="general", source="", created_at=""),
+        ]
+        tier_b = [RankedResult(id="x", content="", type="general", source="", created_at="")]
+        fused = _reciprocal_rank_fusion([tier_a, tier_b])
+        check("a result appearing in two tiers scores higher than one appearing in only one",
+              fused["x"] > fused["y"], f"got x={fused['x']}, y={fused['y']}")
+        check("normalized RRF score never exceeds 1.0",
+              all(v <= 1.0 + 1e-9 for v in fused.values()), f"got {fused}")
+        check("normalized RRF score is comparable in scale to ContextBudgetManager's "
+              "MIN_SCORE=0.05 threshold (a rank-1 single-tier hit must clear it)",
+              fused["y"] > 0.05, f"got {fused['y']} — would be silently dropped downstream")
+
+        now_ts = time.time()
+        recent_r = RankedResult(id="r", content="", type="general", source="", created_at=str(now_ts))
+        old_r = RankedResult(id="o", content="", type="general", source="", created_at=str(now_ts - 365 * 86_400))
+        check("recency multiplier favors a newer result over a year-old one",
+              _recency_multiplier(recent_r, now_ts) > _recency_multiplier(old_r, now_ts))
+        check("recency multiplier has a floor so old results aren't crushed to ~0",
+              _recency_multiplier(old_r, now_ts) >= 0.7 - 1e-9,
+              f"got {_recency_multiplier(old_r, now_ts)}")
+
         # ── Test 4: Budget manager ────────────────────────────────────────
         print("\n[4] ContextBudgetManager (hard 4000-token limit)")
 
