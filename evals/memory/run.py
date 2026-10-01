@@ -22,6 +22,13 @@ without needing network access or an API key to produce that signal honestly.
 See docs/decisions/001-context-engine-and-memory.md for why most of these are
 expected to fail even WITH a live provider today: RAG/world-model retrieval isn't
 wired into the request path yet (Steps D-F fix that).
+
+SAFETY NOTE for a real-provider run: this harness uses the real ToolRegistry with
+no approval_callback wired up. CONFIRM-tier tool calls are auto-denied (Executor
+denies by default with no callback), but AUTO-tier tools (open_app, show_notification,
+control_volume, ...) execute for real if the live model decides to call one — this
+is deliberate (an eval that fakes tool execution isn't evaluating the real agent),
+but it means a real-provider run can visibly do things on the machine it runs on.
 """
 
 from __future__ import annotations
@@ -38,18 +45,15 @@ from pathlib import Path
 SCENARIOS_DIR = Path(__file__).with_name("scenarios")
 RESULTS_DIR = Path(__file__).parent.parent / "results"
 
-_PASS = 0
-_FAIL = 0
-_SKIP = 0
-
 
 def check(name: str, condition: bool, detail: str = "") -> None:
-    global _PASS, _FAIL
+    # Printing only — the authoritative pass/fail/total counts are computed
+    # in run_all() from the structured `results` list (used for the JSON
+    # output too), not tallied here, so there's no separate counter to drift
+    # out of sync with it.
     if condition:
-        _PASS += 1
         print(f"  PASS  {name}")
     else:
-        _FAIL += 1
         print(f"  FAIL  {name}" + (f" | {detail}" if detail else ""))
 
 
@@ -138,10 +142,6 @@ def _check_expect(expect: dict, response_text: str) -> tuple[bool, str]:
 async def run_scenario(scenario: dict, provider_available: bool) -> dict:
     name = scenario["name"]
     family = scenario.get("family", "unknown")
-
-    if not provider_available:
-        # Still real, not a no-op: continues below with the abstaining stand-in.
-        pass
 
     from atlas.config import Settings
     from atlas.memory.store import MemoryStore
