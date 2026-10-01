@@ -1,0 +1,23 @@
+{
+  "name": "people_resolution",
+  "family": "people_resolution",
+  "description": "\"Priya\", \"she\", and \"my manager\" must resolve to the same entity.",
+  "sessions": [
+    {"turns": [
+      "My manager is Priya.",
+      "Priya said she's free on Friday for the 1:1."
+    ]},
+    {
+      "turns": [
+        {
+          "text": "What did my manager say about Friday?",
+          "expect": {
+            "contains_any": ["free", "available"],
+            "contains": ["Friday"],
+            "must_not_contain": ["don't know", "not sure", "no information", "who is my manager"]
+          }
+        }
+      ]
+    }
+  ]
+}

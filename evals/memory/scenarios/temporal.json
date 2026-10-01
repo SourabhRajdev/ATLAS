@@ -1,0 +1,22 @@
+{
+  "name": "temporal",
+  "family": "temporal",
+  "description": "What was I working on N days ago? Phrased as a fixed day-count rather than a weekday name ('last Tuesday') so the scenario is deterministic regardless of which day the suite actually runs on. The harness backdates this session's message timestamps by `days_ago` after the turn completes.",
+  "sessions": [
+    {
+      "days_ago": 6,
+      "turns": ["I'm spending today debugging the retrieval pipeline performance issue."]
+    },
+    {
+      "turns": [
+        {
+          "text": "What did I say I was working on 6 days ago?",
+          "expect": {
+            "contains_any": ["retrieval", "performance", "debugging"],
+            "must_not_contain": ["don't know", "not sure", "no information"]
+          }
+        }
+      ]
+    }
+  ]
+}

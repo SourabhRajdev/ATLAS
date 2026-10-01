@@ -1,0 +1,18 @@
+{
+  "name": "preference_learning",
+  "family": "preference_learning",
+  "description": "A correction in session 1 changes behaviour in session 2. Checked structurally (bullet-point markers) rather than by exact wording, since the model can satisfy the preference many ways.",
+  "sessions": [
+    {"turns": ["Please summarize everything in bullet points, not paragraphs, from now on."]},
+    {
+      "turns": [
+        {
+          "text": "Summarize the current state of the ATLAS project in a couple of lines.",
+          "expect": {
+            "matches_regex": "(^|\\n)\\s*[-*•]\\s"
+          }
+        }
+      ]
+    }
+  ]
+}
