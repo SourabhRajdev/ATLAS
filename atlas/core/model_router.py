@@ -58,10 +58,20 @@ class LLMResponse:
 # ---------------------------------------------------------------------------
 
 def _to_oai_messages(messages: list[dict], system_prompt: str) -> list[dict]:
-    """Convert internal format to OpenAI-compatible messages list."""
+    """Convert internal format to OpenAI-compatible messages list.
+
+    Tool-call IDs are tracked positionally (a list, in call order), not by
+    tool name. Two parallel calls to the same tool (e.g. two `read_file`
+    calls in one round) must get distinct IDs, and the function_response
+    parts that follow are emitted in the same order the calls were made
+    (see Executor._agent_loop's `zip(new_calls, results)`), so matching by
+    position is correct and name-keyed matching is not: a dict keyed by
+    name can only remember the *last* call to a given tool, so the first
+    of two parallel same-name calls silently gets the second call's ID.
+    """
     result: list[dict] = [{"role": "system", "content": system_prompt}]
     call_counter = 0
-    last_call_ids: dict[str, str] = {}  # name → id, reset each assistant tool-call turn
+    last_call_ids: list[str] = []  # ids for the most recent assistant tool-call turn, in call order
 
     for msg in messages:
         role = msg["role"]
@@ -72,24 +82,28 @@ def _to_oai_messages(messages: list[dict], system_prompt: str) -> list[dict]:
         fn_responses = [p["function_response"] for p in parts if "function_response" in p]
 
         if fn_responses:
-            # Tool result messages — must reference the tool_call_id
-            for fr in fn_responses:
-                name = fr["name"]
+            # Tool result messages — must reference the tool_call_id, matched
+            # by position against the ids assigned to the preceding assistant
+            # tool-call turn.
+            for i, fr in enumerate(fn_responses):
                 resp = fr.get("response", {})
                 content = resp.get("result", "") if isinstance(resp, dict) else str(resp)
-                tc_id = last_call_ids.get(name, f"call_{name}")
+                if i < len(last_call_ids):
+                    tc_id = last_call_ids[i]
+                else:
+                    tc_id = f"call_{fr.get('name', 'unknown')}_{i}"
                 result.append({"role": "tool", "tool_call_id": tc_id, "content": content})
 
         elif fn_calls:
             # Assistant turn with tool calls
-            last_call_ids = {}
+            last_call_ids = []
             oai_tcs = []
             for fc in fn_calls:
                 name = fc["name"]
                 args = fc.get("args", {})
                 call_counter += 1
-                tc_id = f"call_{name}_{call_counter}"
-                last_call_ids[name] = tc_id
+                tc_id = f"call_{call_counter}"
+                last_call_ids.append(tc_id)
                 oai_tcs.append({
                     "id": tc_id,
                     "type": "function",

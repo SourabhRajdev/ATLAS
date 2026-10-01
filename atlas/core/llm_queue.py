@@ -22,7 +22,16 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
+from atlas.core.models import EventType
+
 logger = logging.getLogger("atlas.llm_queue")
+
+# Lanes: interactive requests must never queue behind background work.
+# Each lane gets its own queue and worker(s) so a slow background call
+# cannot occupy the only worker a foreground request is waiting on.
+LANE_INTERACTIVE = "interactive"
+LANE_BACKGROUND = "background"
+_BACKGROUND_CONCURRENCY = 2   # small, preemptible-in-spirit pool; never 1-at-a-time with interactive
 
 # How many seconds a cached response is valid for.
 # Dynamic queries (time, clipboard) get short TTL; stable queries get longer.
@@ -59,27 +68,40 @@ class _QueueItem:
     priority:   int
     enqueued_at: float
     # non-compared fields
-    query:      str      = field(compare=False)
-    session_id: str      = field(compare=False)
-    world:      str | None = field(compare=False)
-    future:     asyncio.Future = field(compare=False)
+    future:     asyncio.Future = field(compare=False, default=None)
+    query:      str      = field(compare=False, default="")
+    session_id: str      = field(compare=False, default="")
+    world:      str | None = field(compare=False, default=None)
+    # Set instead of (query, session_id, world) for one-off jobs that don't
+    # fit the conversational-turn shape (see LLMQueue.run_job).
+    job_fn:     Callable[[], Awaitable[Any]] | None = field(compare=False, default=None)
 
 
 class LLMQueue:
-    """Serial LLM request queue with caching, dedup, and context compression."""
+    """LLM request queue with caching, dedup, and context compression.
+
+    Two independent lanes, each with its own queue:
+      - interactive: the user is waiting. One worker, FIFO/priority within lane.
+      - background:  proactive evaluation, memory extraction, etc. A small
+                      concurrent pool, entirely separate from the interactive
+                      worker so it can never make a foreground request wait.
+    """
 
     def __init__(self, process_fn: Callable[..., Awaitable[Any]]) -> None:
         """
         process_fn: async (query, session_id, world_summary) -> (response, trace)
         """
         self._process = process_fn
-        self._queue: asyncio.PriorityQueue[_QueueItem] = asyncio.PriorityQueue()
+        self._queues: dict[str, asyncio.PriorityQueue[_QueueItem]] = {
+            LANE_INTERACTIVE: asyncio.PriorityQueue(),
+            LANE_BACKGROUND: asyncio.PriorityQueue(),
+        }
         # cache: query_hash -> (result, timestamp)
         self._cache: dict[str, tuple[Any, float]] = {}
         # in-flight dedup: query_hash -> list[Future] waiting for the same result
         self._in_flight: dict[str, list[asyncio.Future]] = {}
         self._running = False
-        self._worker_task: asyncio.Task | None = None
+        self._worker_tasks: list[asyncio.Task] = []
         # stats
         self._stat_enqueued = 0
         self._stat_cache_hits = 0
@@ -92,13 +114,20 @@ class LLMQueue:
 
     async def start(self) -> None:
         self._running = True
-        self._worker_task = asyncio.create_task(self._worker(), name="llm-queue-worker")
-        logger.info("LLMQueue started")
+        self._worker_tasks = [
+            asyncio.create_task(self._worker(LANE_INTERACTIVE), name="llm-queue-interactive"),
+        ]
+        self._worker_tasks += [
+            asyncio.create_task(self._worker(LANE_BACKGROUND), name=f"llm-queue-background-{i}")
+            for i in range(_BACKGROUND_CONCURRENCY)
+        ]
+        logger.info("LLMQueue started (1 interactive worker, %d background)", _BACKGROUND_CONCURRENCY)
 
     def stop(self) -> None:
         self._running = False
-        if self._worker_task and not self._worker_task.done():
-            self._worker_task.cancel()
+        for t in self._worker_tasks:
+            if not t.done():
+                t.cancel()
         logger.info("LLMQueue stopped")
 
     # ------------------------------------------------------------------ #
@@ -111,8 +140,16 @@ class LLMQueue:
         session_id: str,
         world_summary: str | None = None,
         priority: Priority = PRIORITY_NORMAL,
+        lane: str = LANE_INTERACTIVE,
     ) -> Any:
-        """Submit a query. Returns (response, trace) when processed."""
+        """Submit a query. Returns (response, trace) when processed.
+
+        `lane` decides which worker pool serves this request. Background
+        callers (proactive evaluation, memory extraction) MUST pass
+        lane=LANE_BACKGROUND so they never occupy the interactive worker.
+        """
+        if lane not in self._queues:
+            raise ValueError(f"unknown lane: {lane}")
         self._stat_enqueued += 1
         key = _cache_key(query)
 
@@ -145,8 +182,41 @@ class LLMQueue:
             world=world_summary,
             future=fut,
         )
-        await self._queue.put(item)
-        logger.debug("queued (pri=%d, depth=%d): %s", priority, self._queue.qsize(), query[:40])
+        queue = self._queues[lane]
+        await queue.put(item)
+        logger.debug("queued [%s] (pri=%d, depth=%d): %s", lane, priority, queue.qsize(), query[:40])
+        return await fut
+
+    async def run_job(
+        self,
+        job_fn: Callable[[], Awaitable[Any]],
+        *,
+        priority: Priority = PRIORITY_NORMAL,
+        lane: str = LANE_BACKGROUND,
+        label: str = "job",
+    ) -> Any:
+        """Run a one-off async callable on a lane's worker pool.
+
+        For background model calls that don't fit enqueue()'s conversational
+        (query, session_id, world_summary) -> (response, trace) shape — e.g.
+        AttentionSystem's per-signal classification call. No caching, no
+        dedup (there's no stable query text to key on); the only thing this
+        gives you is the lane's concurrency isolation, which is the point:
+        a slow background job still can't occupy the interactive worker.
+        """
+        if lane not in self._queues:
+            raise ValueError(f"unknown lane: {lane}")
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        item = _QueueItem(
+            priority=priority,
+            enqueued_at=time.time(),
+            future=fut,
+            job_fn=job_fn,
+        )
+        queue = self._queues[lane]
+        await queue.put(item)
+        logger.debug("queued [%s] (pri=%d, depth=%d): job:%s", lane, priority, queue.qsize(), label)
         return await fut
 
     def stats(self) -> dict:
@@ -158,36 +228,62 @@ class LLMQueue:
             "dedup_hits":  self._stat_dedup_hits,
             "llm_rate":    f"{self._stat_llm_calls / total:.0%}",
             "savings":     f"{(total - self._stat_llm_calls) / total:.0%}",
-            "queue_depth": self._queue.qsize(),
+            "queue_depth": sum(q.qsize() for q in self._queues.values()),
+            "queue_depth_interactive": self._queues[LANE_INTERACTIVE].qsize(),
+            "queue_depth_background":  self._queues[LANE_BACKGROUND].qsize(),
         }
 
     # ------------------------------------------------------------------ #
-    #  Worker (runs forever, processes one item at a time)                #
+    #  Worker (one per lane-slot; interactive and background never share) #
     # ------------------------------------------------------------------ #
 
-    async def _worker(self) -> None:
-        logger.info("LLMQueue worker running")
+    async def _worker(self, lane: str) -> None:
+        queue = self._queues[lane]
+        logger.info("LLMQueue worker running (%s)", lane)
         while self._running:
             # Poll with timeout so we can exit cleanly
             try:
-                item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                item = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
                 return
 
-            key = _cache_key(item.query)
-            waiters = self._in_flight.pop(key, [])
             wait_s = time.time() - item.enqueued_at
 
+            # One-off job (run_job) — no cache/dedup bookkeeping, just run it
+            # in isolation on this lane's worker.
+            if item.job_fn is not None:
+                if wait_s > 0.1:
+                    logger.debug("queue wait [%s]: %.2fs for job", lane, wait_s)
+                self._stat_llm_calls += 1
+                try:
+                    result = await item.job_fn()
+                    if not item.future.done():
+                        item.future.set_result(result)
+                except Exception as e:
+                    logger.error("background job failed: %s", e)
+                    if not item.future.done():
+                        item.future.set_exception(e)
+                finally:
+                    queue.task_done()
+                continue
+
+            key = _cache_key(item.query)
+            waiters = self._in_flight.pop(key, [])
+
             if wait_s > 0.1:
-                logger.debug("queue wait: %.2fs for: %s", wait_s, item.query[:40])
+                logger.debug("queue wait [%s]: %.2fs for: %s", lane, wait_s, item.query[:40])
 
             self._stat_llm_calls += 1
             try:
                 result = await self._process(item.query, item.session_id, item.world)
-                # Cache the result
-                self._cache[key] = (result, time.time())
+                # Only cache responses with no tool calls. A cached response
+                # that actually ran a tool (volume up, send it, next track)
+                # would silently skip re-running that tool's side effect the
+                # next time the same text comes in within the TTL window.
+                if _is_cacheable(result):
+                    self._cache[key] = (result, time.time())
                 # Resolve all waiters (dedup'd requests)
                 for f in waiters:
                     if not f.done():
@@ -198,9 +294,9 @@ class LLMQueue:
                     if not f.done():
                         f.set_exception(e)
             finally:
-                self._queue.task_done()
+                queue.task_done()
 
-        logger.info("LLMQueue worker exited")
+        logger.info("LLMQueue worker exited (%s)", lane)
 
 
 # ------------------------------------------------------------------ #
@@ -242,6 +338,24 @@ def compress_history(history: list[dict]) -> list[dict]:
 # ------------------------------------------------------------------ #
 #  Helpers                                                           #
 # ------------------------------------------------------------------ #
+
+def _is_cacheable(result: Any) -> bool:
+    """A response is safe to cache only if producing it had no side effects.
+
+    `result` is whatever `process_fn` returns — normally (response_text, trace)
+    where trace.observations is a list of Events. If any observation is a
+    TOOL_CALL, re-serving this exact result for an identical later query would
+    silently skip re-executing that tool (e.g. "volume up" called once, then
+    answered from cache on repeat with the volume never actually changing).
+    """
+    if not isinstance(result, tuple) or len(result) != 2:
+        return True
+    _, trace = result
+    observations = getattr(trace, "observations", None)
+    if observations is None:
+        return True
+    return not any(getattr(ev, "type", None) == EventType.TOOL_CALL for ev in observations)
+
 
 def _cache_key(query: str) -> str:
     return hashlib.md5(query.lower().strip().encode()).hexdigest()

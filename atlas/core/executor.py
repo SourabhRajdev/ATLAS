@@ -35,6 +35,28 @@ _EXTERNAL_CONTENT_TOOLS: frozenset[str] = frozenset({
     "read_screen_text", "see_screen",         # screen content is untrusted
 })
 
+# Loop detection: a tool call is blocked once it would be the Nth consecutive
+# identical (name, args) call with no *different* call in between. A different
+# call in between (e.g. a write/act tool ran) resets the count, since
+# re-reading state after an action is legitimate, not a loop.
+_LOOP_REPEAT_LIMIT = 3
+
+# Also catch alternating/cyclic loops the consecutive-repeat check above
+# misses: A,B,A,B,A,B (e.g. read file -> write the same content -> read ...).
+# A period-2 or period-3 window that repeats this many times back-to-back,
+# with nothing outside the window in between, is a loop. A genuine re-read
+# after a real change has different args each time (different write content),
+# so its signatures differ and this never matches — only a truly identical
+# cycle does.
+_CYCLE_PERIODS = (2, 3)
+_CYCLE_REPEATS = 3
+
+# Tool result truncation: keep head + tail instead of head-only, so the part
+# of a long output that actually matters (the error at the bottom of a test
+# run, the final lines of a build log) isn't silently dropped.
+_TRUNCATE_HEAD = 3000
+_TRUNCATE_TAIL = 1000
+
 
 SYSTEM_PROMPT = """\
 You are ATLAS — a Jarvis-level AI running natively on the user's MacBook Pro. \
@@ -137,9 +159,12 @@ class Executor:
             intro = f"Current world state:\n{world_state_summary}\n\n{intro}"
         state.messages.append({"role": "user", "parts": [{"text": intro}]})
 
-        seen_calls: set[str] = set()
+        # Ordered history of executed call signatures, used for loop detection.
+        # A list (not a set) because what matters is *consecutive* repeats,
+        # not whether a signature was ever seen before in the whole task.
+        call_history: list[str] = []
 
-        async for ev in self._agent_loop(state, budget, seen_calls):
+        async for ev in self._agent_loop(state, budget, call_history):
             ev.task_id = state.id
             state.observations.append(ev)
             yield ev
@@ -161,10 +186,10 @@ class Executor:
         self,
         state: TaskState,
         budget: Budget,
-        seen_calls: set[str],
+        call_history: list[str],
     ) -> AsyncIterator[Event]:
         tool_defs = self.tools.get_anthropic_tools()
-        max_rounds = 10
+        max_rounds = budget.max_rounds
 
         for _round in range(max_rounds):
             if budget.exhausted:
@@ -219,18 +244,38 @@ class Executor:
                 yield Event(type=EventType.DONE, content=response.text.strip() or "(no response)")
                 return
 
-            # Loop detection
+            # Loop detection — block a call only once it would be the
+            # _LOOP_REPEAT_LIMIT'th consecutive identical call, or complete a
+            # period-2/3 cycle repeating _CYCLE_REPEATS times, with nothing
+            # different executed in between either way. Re-reading the screen
+            # or re-running tests after a fix is legitimate and must not trip
+            # this; a tight repeat (or alternation) of the exact same calls
+            # with no intervening action is the actual loop signature.
             new_calls: list[ToolCall] = []
             for tc in response.tool_calls:
                 sig = _call_signature(tc)
-                if sig in seen_calls:
-                    yield Event(type=EventType.ERROR,
-                                content=f"loop detected: {tc.name}",
-                                metadata={"recoverable": False})
+                trailing = 0
+                for prev_sig in reversed(call_history):
+                    if prev_sig == sig:
+                        trailing += 1
+                    else:
+                        break
+                candidate_history = call_history + [sig]
+                is_loop = trailing >= _LOOP_REPEAT_LIMIT - 1 or any(
+                    _tail_has_cycle(candidate_history, period, _CYCLE_REPEATS)
+                    for period in _CYCLE_PERIODS
+                )
+                if is_loop:
+                    yield Event(
+                        type=EventType.ERROR,
+                        content=f"loop detected: {tc.name} repeated "
+                                f"with no intervening action",
+                        metadata={"recoverable": False},
+                    )
                     yield Event(type=EventType.DONE,
                                 content=response.text.strip() or "(stopped: loop detected)")
                     return
-                seen_calls.add(sig)
+                call_history.append(sig)
                 new_calls.append(tc)
 
             # Execute tool calls in parallel
@@ -373,13 +418,29 @@ def _call_signature(tc: ToolCall) -> str:
     return f"{tc.name}:{json.dumps(tc.args, sort_keys=True, default=str)}"
 
 
+def _tail_has_cycle(history: list[str], period: int, repeats: int) -> bool:
+    """True if the last `period * repeats` entries are `repeats` back-to-back
+    copies of the same `period`-length window (e.g. period=2: A,B,A,B,A,B)."""
+    n = period * repeats
+    if len(history) < n:
+        return False
+    tail = history[-n:]
+    window = tail[-period:]
+    return all(tail[i * period:(i + 1) * period] == window for i in range(repeats - 1))
+
+
 def _compact(result: dict) -> str:
     if "error" in result:
         return f"ERROR: {result['error']}"
     s = result.get("result", "")
-    if len(s) > 4000:
-        return s[:4000] + f"\n... [truncated, {len(s) - 4000} more chars]"
-    return s
+    if len(s) <= _TRUNCATE_HEAD + _TRUNCATE_TAIL:
+        return s
+    omitted = len(s) - _TRUNCATE_HEAD - _TRUNCATE_TAIL
+    return (
+        s[:_TRUNCATE_HEAD]
+        + f"\n... [{omitted} chars omitted] ...\n"
+        + s[-_TRUNCATE_TAIL:]
+    )
 
 
 def _is_transient_err(err: str) -> bool:

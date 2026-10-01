@@ -17,6 +17,7 @@ from atlas.autonomy.models import ActionDecision, Attention, Priority, Proactive
 from atlas.autonomy.scoring import SignalScorer
 from atlas.autonomy.signals import SignalDetector
 from atlas.config import Settings
+from atlas.core.llm_queue import LLMQueue
 from atlas.interfaces.presence import create_presence_layer
 from atlas.memory.store import MemoryStore
 from atlas.scheduler.scheduler import Scheduler
@@ -35,15 +36,17 @@ class AutonomyLoop:
         scheduler: Scheduler,
         tools: ToolRegistry,
         client: genai.Client,
+        llm_queue: LLMQueue | None = None,
     ) -> None:
         self.config = config
         self.memory = memory
         self.scheduler = scheduler
         self.tools = tools
         self.client = client
-        
+        self.llm_queue = llm_queue
+
         self.signal_detector = SignalDetector(memory, scheduler)
-        self.attention_system = AttentionSystem(config, client)
+        self.attention_system = AttentionSystem(config, client, llm_queue=llm_queue)
         self.signal_scorer = SignalScorer()
         self.context_gate = ContextGate()
         self.autonomy_logger = AutonomyLogger(config.data_dir / "autonomy.log")

@@ -136,15 +136,26 @@ class MemoryEntry(BaseModel):
 
 @dataclass
 class Budget:
-    max_ms: int = 30_000
-    max_tool_calls: int = 8
+    # Defaults are the general interactive case: a real multi-step task
+    # (e.g. "fix the failing test and verify it") needs room for ~40 tool
+    # calls at a few seconds each, which is where the 5-minute wall-clock
+    # ceiling comes from — these three numbers must move together, or
+    # raising max_rounds alone (as Phase 0 did) is cosmetic: the task still
+    # dies on whichever of max_ms/max_tool_calls is hit first.
+    max_ms: int = 5 * 60_000
+    max_tool_calls: int = 40
     max_tokens: int = 8_000
+    max_rounds: int = 40   # agent-loop rounds; was a hardcoded 10 in Executor
     started_at: float = field(default_factory=time.time)
     tool_calls_used: int = 0
     tokens_used: int = 0
 
     @staticmethod
     def for_query(query: str) -> Budget:
+        # Trivial/simple queries intentionally get a much smaller budget than
+        # the general case above — "what time is it" doesn't need 40 tool
+        # calls, and a tight budget fails fast instead of letting a
+        # misrouted simple query wander.
         words = len(query.split())
         has_email = "@" in query
         if words <= 5 and not has_email:
@@ -154,6 +165,16 @@ class Budget:
         if query.lower().startswith(("what ", "who ", "when ", "where ", "how much ")):
             return Budget(max_tool_calls=4, max_ms=20_000)
         return Budget()
+
+    @staticmethod
+    def for_background(query: str = "") -> Budget:
+        """Larger budget for background/long-running tasks (Phase 4 task runner).
+
+        Background work isn't blocking an interactive user, so it can afford
+        more rounds and tool calls before being cut off than the interactive
+        default above.
+        """
+        return Budget(max_tool_calls=60, max_ms=20 * 60_000, max_tokens=64_000, max_rounds=100)
 
     @property
     def exhausted(self) -> bool:
