@@ -25,6 +25,10 @@ Copyright © 2026 Sourabh Rajdev. All Rights Reserved.
 
 <br/>
 
+> **Status (Phase 0 of the v1 redirection):** the 337/337 tests above are real and passing, and the 8 systems below are genuinely built — but most of them are not yet wired into the live request path (e.g. RAG retrieval and the world model are not read into the prompt; multi-agent routing is keyword-based, not model-driven). See `ATLAS_V1_DIRECTION.md` for the honest claim-vs-code audit and the phased plan to wire them in.
+
+<br/>
+
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  "The first AI assistant that genuinely knows you —              │

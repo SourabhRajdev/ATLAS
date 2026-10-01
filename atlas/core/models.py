@@ -139,6 +139,7 @@ class Budget:
     max_ms: int = 30_000
     max_tool_calls: int = 8
     max_tokens: int = 8_000
+    max_rounds: int = 40   # agent-loop rounds; was a hardcoded 10 in Executor
     started_at: float = field(default_factory=time.time)
     tool_calls_used: int = 0
     tokens_used: int = 0
@@ -154,6 +155,15 @@ class Budget:
         if query.lower().startswith(("what ", "who ", "when ", "where ", "how much ")):
             return Budget(max_tool_calls=4, max_ms=20_000)
         return Budget()
+
+    @staticmethod
+    def for_background(query: str = "") -> Budget:
+        """Larger budget for background/long-running tasks (Phase 4 task runner).
+
+        Background work isn't blocking an interactive user, so it can afford
+        more rounds and tool calls before being cut off.
+        """
+        return Budget(max_tool_calls=40, max_ms=20 * 60_000, max_tokens=64_000, max_rounds=100)
 
     @property
     def exhausted(self) -> bool:

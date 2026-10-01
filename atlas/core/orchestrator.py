@@ -107,8 +107,8 @@ class Orchestrator:
         self.world_model = WorldModel(config.data_dir / "world.db")
 
         # System 5: Production RAG (uses same DB as memory store)
-        self.rag = RAGRetriever(config.db_path)
-        self.rag_ingestion = IngestionPipeline(config.db_path)
+        self.rag = RAGRetriever(memory, self.world_model)
+        self.rag_ingestion = IngestionPipeline(memory, self.world_model)
 
         # System 2: Proactive Intelligence
         self.proactive = ProactiveEngine(
