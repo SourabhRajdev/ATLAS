@@ -105,9 +105,18 @@ class Attribute:
     source: str
     recorded_at: float
     superseded_by: int | None = None
+    taint: str = "clean"              # atlas.trust.taint.TaintLevel name
+    evidence_msg_id: str | None = None  # messages.id this fact was extracted from
+    valid_to: float | None = None     # set when superseded; None = still current
 
     def is_current(self) -> bool:
-        return self.superseded_by is None
+        return self.valid_to is None
+
+    def is_valid_at(self, ts: float) -> bool:
+        """True if this value was the recorded one at timestamp `ts` —
+        for 'what was true on date X' queries that need history, not just
+        the current value."""
+        return self.recorded_at <= ts and (self.valid_to is None or ts < self.valid_to)
 
 
 @dataclass

@@ -9,8 +9,9 @@ Call path:
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from atlas.config import Settings
 from atlas.core.executor import Executor
@@ -21,6 +22,9 @@ from atlas.memory.store import MemoryStore
 from atlas.tools.registry import ToolRegistry
 from atlas.trust import TrustLayer
 
+if TYPE_CHECKING:
+    from atlas.world.world_model import WorldModel
+
 logger = logging.getLogger("atlas.engine")
 
 # Verbatim turns kept in context — older turns are compressed to a summary.
@@ -29,10 +33,17 @@ MAX_VERBATIM_TURNS = 3
 
 
 class Engine:
-    def __init__(self, config: Settings, memory: MemoryStore, tools: ToolRegistry) -> None:
+    def __init__(
+        self,
+        config: Settings,
+        memory: MemoryStore,
+        tools: ToolRegistry,
+        world_model: "WorldModel | None" = None,
+    ) -> None:
         self.config = config
         self.memory = memory
         self.tools = tools
+        self.world_model = world_model
 
         # ModelRouter: Gemini → Groq → Ollama failover
         self.model_router, self.client = build_model_router(config)
@@ -51,6 +62,20 @@ class Engine:
 
         # LLMQueue wraps _process_llm so the orchestrator can use it directly
         self.llm_queue = LLMQueue(process_fn=self._process_llm)
+
+        # Detached background jobs (fact extraction) spawned per turn — tracked
+        # so they're not garbage-collected mid-flight, and so callers can wait
+        # for them to settle before tearing down memory/world_model.
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    def _spawn_background(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def drain_background_tasks(self) -> None:
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
 
     def set_approval_callback(self, fn: Callable) -> None:
         self.executor.approval_callback = fn
@@ -81,9 +106,8 @@ class Engine:
         session_id: str,
         world_state_summary: str | None = None,
     ) -> tuple[str, TaskState]:
-        self.memory.add_message(Message(
-            session_id=session_id, role="user", content=user_input,
-        ))
+        user_message = Message(session_id=session_id, role="user", content=user_input)
+        self.memory.add_message(user_message)
 
         trace = TaskState(goal=user_input, session_id=session_id)
         final_response = ""
@@ -124,7 +148,29 @@ class Engine:
             session_id=session_id, role="assistant", content=final_response,
         ))
 
+        if self.world_model is not None:
+            # Fire-and-forget: the interactive reply above must never wait on
+            # this. Runs through LLMQueue's background lane (atlas/world/
+            # fact_extraction.py), which is isolated from the interactive
+            # worker — see atlas/core/llm_queue.py.
+            taint_level = self.executor.current_taint_level
+            self._spawn_background(self._extract_facts_background(
+                user_input, session_id, user_message.id, taint_level,
+            ))
+
         return final_response, trace
+
+    async def _extract_facts_background(
+        self, user_input: str, session_id: str, message_id: str, taint_level: str,
+    ) -> None:
+        from atlas.world.fact_extraction import extract_and_store
+        try:
+            await extract_and_store(
+                user_input, self.world_model, self.model_router, self.llm_queue,
+                taint=taint_level, evidence_msg_id=message_id,
+            )
+        except Exception as e:
+            logger.warning("background fact extraction failed (session=%s): %s", session_id, e)
 
     async def stream(
         self,

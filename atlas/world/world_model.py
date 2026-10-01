@@ -174,13 +174,17 @@ class WorldModel:
         value: str,
         source: str,
         confidence: float | None = None,
+        taint: str = "clean",
+        evidence_msg_id: str | None = None,
     ) -> Attribute:
         return await asyncio.to_thread(
-            self._update_attribute_sync, entity_id, key, value, source, confidence
+            self._update_attribute_sync, entity_id, key, value, source, confidence,
+            taint, evidence_msg_id,
         )
 
     def _update_attribute_sync(
-        self, entity_id: str, key: str, value: str, source: str, confidence: float | None
+        self, entity_id: str, key: str, value: str, source: str, confidence: float | None,
+        taint: str = "clean", evidence_msg_id: str | None = None,
     ) -> Attribute:
         now = time.time()
         source_confidence = confidence or SOURCE_RELIABILITY.get(source, 0.6)
@@ -203,8 +207,28 @@ class WorldModel:
                 self._conn.commit()
                 return _row_to_attribute(existing)
 
-            # Value changed — supersede old entry, insert new
-            new_id = self._insert_attribute(entity_id, key, value, source_confidence, source, now)
+            # Value changed — close the OLD row out first (valid_to = now),
+            # THEN insert the new one. Never delete the old row: the whole
+            # point of supersession is that "lives_in=Vellore" stays
+            # queryable as history after "lives_in=Bangalore" supersedes it.
+            #
+            # Order matters: idx_attr_current (schema.py) is a unique index
+            # on (entity_id, key, source) scoped to valid_to IS NULL. Setting
+            # valid_to on the old row FIRST needs only data we already have;
+            # inserting the new row first would briefly make both rows
+            # "current" at once (the new row doesn't know the old row's id
+            # to close it atomically), which the unique index correctly
+            # rejects.
+            self._conn.execute(
+                "UPDATE attributes SET valid_to = ? WHERE id = ?",
+                (now, existing["id"]),
+            )
+            new_id = self._insert_attribute(
+                entity_id, key, value, source_confidence, source, now,
+                taint, evidence_msg_id,
+            )
+            # superseded_by is the audit pointer (old -> new); valid_to above
+            # is what the uniqueness constraint actually relies on.
             self._conn.execute(
                 "UPDATE attributes SET superseded_by = ? WHERE id = ?",
                 (new_id, existing["id"]),
@@ -212,7 +236,10 @@ class WorldModel:
         else:
             # New attribute for this source — check for conflicting values from other sources
             # Keep both, confidence-weighted by source reliability
-            new_id = self._insert_attribute(entity_id, key, value, source_confidence, source, now)
+            new_id = self._insert_attribute(
+                entity_id, key, value, source_confidence, source, now,
+                taint, evidence_msg_id,
+            )
 
         self._conn.execute(
             "UPDATE entities SET last_updated = ? WHERE id = ?", (now, entity_id)
@@ -226,23 +253,48 @@ class WorldModel:
 
     def _insert_attribute(
         self, entity_id: str, key: str, value: str,
-        confidence: float, source: str, now: float
+        confidence: float, source: str, now: float,
+        taint: str = "clean", evidence_msg_id: str | None = None,
     ) -> int:
+        # Plain INSERT, not INSERT OR REPLACE: the partial unique index only
+        # constrains the current (superseded_by IS NULL) row per triple, so
+        # there is nothing left for OR REPLACE to silently delete. The old
+        # OR REPLACE here is what destroyed supersession history (see
+        # docs/decisions/001-context-engine-and-memory.md Section 2.1).
         cur = self._conn.execute(
-            """INSERT OR REPLACE INTO attributes
-               (entity_id, key, value, confidence, source, recorded_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (entity_id, key, value, confidence, source, now),
+            """INSERT INTO attributes
+               (entity_id, key, value, confidence, source, recorded_at, taint, evidence_msg_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (entity_id, key, value, confidence, source, now, taint, evidence_msg_id),
         )
         return cur.lastrowid
 
     def get_attributes(self, entity_id: str) -> list[Attribute]:
+        # valid_to IS NULL, not superseded_by IS NULL — valid_to is what
+        # idx_attr_current actually enforces uniqueness on (see schema.py);
+        # keeping the two in sync but querying the authoritative one.
         rows = self._conn.execute(
-            "SELECT * FROM attributes WHERE entity_id = ? AND superseded_by IS NULL "
+            "SELECT * FROM attributes WHERE entity_id = ? AND valid_to IS NULL "
             "ORDER BY confidence DESC",
             (entity_id,),
         ).fetchall()
         return [_row_to_attribute(r) for r in rows]
+
+    def get_attribute_at(self, entity_id: str, key: str, ts: float) -> Attribute | None:
+        """What was `key` for this entity at timestamp `ts` — history, not
+        just the current value (e.g. "where did I live in August").
+
+        Picks the highest-confidence row whose [recorded_at, valid_to) range
+        covers `ts`, across all sources — same reliability-then-recency
+        resolution get_attributes() already uses for "current" lookups.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM attributes WHERE entity_id = ? AND key = ? "
+            "AND recorded_at <= ? AND (valid_to IS NULL OR valid_to > ?) "
+            "ORDER BY confidence DESC, recorded_at DESC",
+            (entity_id, key, ts, ts),
+        ).fetchall()
+        return _row_to_attribute(rows[0]) if rows else None
 
     # ------------------------------------------------------------------
     # Relationships
@@ -430,6 +482,7 @@ def _row_to_entity(row: sqlite3.Row) -> Entity:
 
 
 def _row_to_attribute(row: sqlite3.Row) -> Attribute:
+    keys = row.keys()
     return Attribute(
         id=row["id"],
         entity_id=row["entity_id"],
@@ -439,6 +492,9 @@ def _row_to_attribute(row: sqlite3.Row) -> Attribute:
         source=row["source"],
         recorded_at=row["recorded_at"],
         superseded_by=row["superseded_by"],
+        taint=row["taint"] if "taint" in keys else "clean",
+        evidence_msg_id=row["evidence_msg_id"] if "evidence_msg_id" in keys else None,
+        valid_to=row["valid_to"] if "valid_to" in keys else None,
     )
 
 

@@ -126,6 +126,14 @@ class Executor:
         # Taint context for current request — updated per execution
         self._current_taint: TaintContext = TaintContext.clean()
 
+    @property
+    def current_taint_level(self) -> str:
+        """Lowercase TaintLevel name for the most recently completed request —
+        'clean' unless an external-content tool ran during it. Used by callers
+        that need to tag downstream work (e.g. background fact extraction)
+        with the taint of the turn that produced it."""
+        return self._current_taint.level.name.lower()
+
     # ------------------------------------------------------------------
     # Public entry point — async iterator of Events
     # ------------------------------------------------------------------

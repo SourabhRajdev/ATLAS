@@ -7,6 +7,7 @@ No API keys required. All tests use a temp SQLite database.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import time
@@ -93,6 +94,135 @@ async def run_tests() -> None:
         all_attrs_2 = world.get_attributes(e1.id)
         email_sources = {a.source for a in all_attrs_2 if a.key == "email"}
         check("multiple sources stored", "gmail" in email_sources or "imessage" in email_sources)
+
+        # ── Test 3b: Supersession actually preserves history (regression) ──
+        # Test 3 above only ever queries get_attributes(), which filters to
+        # current rows — it would pass whether the old value was soft
+        # -superseded or hard-deleted. This checks the raw table directly,
+        # which is the only way the original bug (UNIQUE(entity_id, key,
+        # source) + INSERT OR REPLACE silently deleting the old row instead
+        # of superseding it) was actually caught.
+        print("\n[3b] Attribute Supersession Preserves History (regression)")
+
+        e2 = await world.upsert_entity("Person", "Sourabh", "user")
+        t_before = time.time()
+        await world.update_attribute(e2.id, "lives_in", "Vellore", source="user")
+        t_mid = time.time()
+        await world.update_attribute(e2.id, "lives_in", "Bangalore", source="user")
+        t_after = time.time()
+
+        raw_rows = world._conn.execute(
+            "SELECT value, superseded_by, valid_to FROM attributes "
+            "WHERE entity_id = ? AND key = 'lives_in' ORDER BY id",
+            (e2.id,),
+        ).fetchall()
+        check("both the old and new value exist in the raw table", len(raw_rows) == 2,
+              f"got {len(raw_rows)}: {[dict(r) for r in raw_rows]}")
+        if len(raw_rows) == 2:
+            check("old row (Vellore) is marked superseded, not deleted",
+                  raw_rows[0]["value"] == "Vellore" and raw_rows[0]["superseded_by"] is not None)
+            check("old row's valid_to is set (closed out)", raw_rows[0]["valid_to"] is not None)
+            check("new row (Bangalore) is current (no superseded_by, no valid_to)",
+                  raw_rows[1]["value"] == "Bangalore"
+                  and raw_rows[1]["superseded_by"] is None
+                  and raw_rows[1]["valid_to"] is None)
+
+        current_lives_in = world.get_attributes(e2.id)
+        current_val = next((a.value for a in current_lives_in if a.key == "lives_in"), None)
+        check("current value is the new one", current_val == "Bangalore")
+
+        at_mid = world.get_attribute_at(e2.id, "lives_in", t_mid)
+        check("get_attribute_at(before the move) returns the old value",
+              at_mid is not None and at_mid.value == "Vellore",
+              f"got {at_mid.value if at_mid else None}")
+
+        at_after = world.get_attribute_at(e2.id, "lives_in", t_after)
+        check("get_attribute_at(after the move) returns the new value",
+              at_after is not None and at_after.value == "Bangalore",
+              f"got {at_after.value if at_after else None}")
+
+        attr_with_evidence = await world.update_attribute(
+            e2.id, "preference:summary_style", "bullets", source="user",
+            taint="clean", evidence_msg_id="msg-123",
+        )
+        check("taint round-trips through update_attribute", attr_with_evidence.taint == "clean")
+        check("evidence_msg_id round-trips through update_attribute",
+              attr_with_evidence.evidence_msg_id == "msg-123")
+
+        # ── Test 3c: migrating a pre-existing old-schema DB ─────────────────
+        # Builds a world.db by hand with the OLD schema (table-level
+        # UNIQUE(entity_id, key, source), no taint/evidence/valid_to columns)
+        # to prove open_db()'s migration actually upgrades a real existing
+        # database, not just a fresh one.
+        print("\n[3c] Migrating a Pre-Existing Old-Schema Database")
+
+        import sqlite3
+        old_db_path = Path(tmpdir) / "old_world.db"
+        raw_conn = sqlite3.connect(str(old_db_path))
+        raw_conn.executescript("""
+            CREATE TABLE entities (
+                id TEXT PRIMARY KEY, type TEXT NOT NULL, name TEXT NOT NULL,
+                canonical_name TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 1.0,
+                first_seen REAL NOT NULL, last_updated REAL NOT NULL,
+                last_reinforced REAL NOT NULL, source TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}', embedding BLOB
+            );
+            CREATE TABLE attributes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id TEXT NOT NULL REFERENCES entities(id),
+                key TEXT NOT NULL, value TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0, source TEXT NOT NULL,
+                recorded_at REAL NOT NULL,
+                superseded_by INTEGER REFERENCES attributes(id),
+                UNIQUE(entity_id, key, source)
+            );
+        """)
+        raw_conn.execute(
+            "INSERT INTO entities (id, type, name, canonical_name, first_seen, "
+            "last_updated, last_reinforced, source) VALUES "
+            "('e-old', 'Person', 'Old User', 'old user', ?, ?, ?, 'user')",
+            (time.time(), time.time(), time.time()),
+        )
+        raw_conn.execute(
+            "INSERT INTO attributes (entity_id, key, value, source, recorded_at) "
+            "VALUES ('e-old', 'lives_in', 'Vellore', 'user', ?)",
+            (time.time(),),
+        )
+        raw_conn.commit()
+        raw_conn.close()
+
+        from atlas.world.schema import open_db
+        migrated_conn = open_db(old_db_path)
+        cols = {row["name"] for row in migrated_conn.execute("PRAGMA table_info(attributes)")}
+        check("migration adds taint column", "taint" in cols)
+        check("migration adds evidence_msg_id column", "evidence_msg_id" in cols)
+        check("migration adds valid_to column", "valid_to" in cols)
+
+        index_rows = migrated_conn.execute("PRAGMA index_list(attributes)").fetchall()
+        has_old_unique = any(
+            r["unique"] and r["origin"] == "u" and "autoindex" in r["name"] for r in index_rows
+        )
+        check("old table-level UNIQUE autoindex is gone after migration", not has_old_unique,
+              f"indexes: {[dict(r) for r in index_rows]}")
+
+        preexisting_row = migrated_conn.execute(
+            "SELECT value FROM attributes WHERE entity_id = 'e-old' AND key = 'lives_in'"
+        ).fetchone()
+        check("pre-existing data survived the migration", preexisting_row is not None
+              and preexisting_row["value"] == "Vellore")
+
+        # And the actual bug scenario, replayed against the migrated DB:
+        migrated_world = WorldModel(old_db_path)
+        await migrated_world.update_attribute("e-old", "lives_in", "Bangalore", source="user")
+        migrated_raw = migrated_conn.execute(
+            "SELECT value, valid_to FROM attributes WHERE entity_id = 'e-old' "
+            "AND key = 'lives_in' ORDER BY id"
+        ).fetchall()
+        check("post-migration update_attribute still preserves history (not just on a fresh DB)",
+              len(migrated_raw) == 2 and migrated_raw[0]["value"] == "Vellore"
+              and migrated_raw[1]["value"] == "Bangalore",
+              f"got {[dict(r) for r in migrated_raw]}")
+        migrated_world.close()
 
         # ── Test 4: Relationships ───────────────────────────────────────
         print("\n[4] Relationships")
@@ -230,6 +360,111 @@ async def run_tests() -> None:
         check("git author extracted", author_mention is not None)
         check("git author confidence high", author_mention.confidence >= 0.9 if author_mention else False)
 
+        # ── Test 11: Background Fact Extraction (Phase 1 Step D) ────────────
+        print("\n[11] Background Fact Extraction (LLM path + regex fallback)")
+
+        from atlas.world.fact_extraction import extract_and_store
+
+        class _FakeLLMQueue:
+            """Mirrors LLMQueue.run_job's contract: just runs the job inline."""
+            async def run_job(self, job_fn, lane=None, label=None):
+                return await job_fn()
+
+        class _FailingLLMQueue:
+            async def run_job(self, job_fn, lane=None, label=None):
+                raise RuntimeError("simulated background lane failure")
+
+        class _FakeModelRouter:
+            def __init__(self, text: str) -> None:
+                self._text = text
+
+            async def generate(self, messages, tool_defs, system_prompt):
+                from atlas.core.model_router import LLMResponse
+                return LLMResponse(text=self._text)
+
+        world_ex = WorldModel(Path(tmpdir) / "world_extraction.db")
+
+        # -- Valid extraction: facts (incl. self-reference), preferences, corrections --
+        valid_json = json.dumps({
+            "facts": [
+                {"subject": "I", "subject_type": "Person", "predicate": "lives_in",
+                 "object": "Bangalore", "confidence": 0.9},
+                {"subject": "Priya", "subject_type": "Person", "predicate": "role",
+                 "object": "manager", "confidence": 0.8},
+            ],
+            "preferences": [{"slug": "summary_style", "value": "bullets"}],
+            "corrections": [{"slug": "tone", "old_value": "formal", "new_value": "casual"}],
+        })
+        result = await extract_and_store(
+            "I live in Bangalore. Priya is my manager. Summarize in bullets, casually.",
+            world_ex, _FakeModelRouter(valid_json), _FakeLLMQueue(),
+            taint="clean", evidence_msg_id="msg-1",
+        )
+        check("LLM extraction reports method=llm", result["method"] == "llm")
+        check("LLM extraction wrote both facts", result["facts_written"] == 2, f"got {result}")
+        check("LLM extraction wrote preference + correction", result["preferences_written"] == 2, f"got {result}")
+
+        user_entity = await world_ex.upsert_entity(type="Person", name="user", source="llm_inference")
+        user_attrs = {a.key: a for a in world_ex.get_attributes(user_entity.id)}
+        check("self-reference 'I' resolved to the canonical 'user' entity and wrote lives_in",
+              "lives_in" in user_attrs and user_attrs["lives_in"].value == "Bangalore")
+        check("extracted fact carries the taint it was given", user_attrs["lives_in"].taint == "clean")
+        check("extracted fact carries its evidence_msg_id", user_attrs["lives_in"].evidence_msg_id == "msg-1")
+        check("preference written under preference:<slug>",
+              "preference:summary_style" in user_attrs and user_attrs["preference:summary_style"].value == "bullets")
+        check("correction written the same way as a preference",
+              "preference:tone" in user_attrs and user_attrs["preference:tone"].value == "casual")
+
+        priya_entity = await world_ex.upsert_entity(type="Person", name="Priya", source="llm_inference")
+        priya_attrs = {a.key: a for a in world_ex.get_attributes(priya_entity.id)}
+        check("non-self-referential subject resolved to its own entity, not 'user'",
+              "role" in priya_attrs and priya_attrs["role"].value == "manager")
+
+        # -- Self-reference normalization: "me" maps to the SAME entity as "I" above --
+        me_json = json.dumps({
+            "facts": [{"subject": "me", "subject_type": "Person", "predicate": "timezone",
+                       "object": "IST", "confidence": 0.9}],
+            "preferences": [], "corrections": [],
+        })
+        await extract_and_store("My timezone is IST.", world_ex, _FakeModelRouter(me_json), _FakeLLMQueue())
+        user_attrs_2 = {a.key: a for a in world_ex.get_attributes(user_entity.id)}
+        check("'me' normalizes to the same 'user' entity as 'I' did",
+              "timezone" in user_attrs_2 and "lives_in" in user_attrs_2,
+              "both facts should land on the same entity's attribute list")
+
+        # -- Markdown-fenced JSON still parses --
+        fenced_json = "```json\n" + json.dumps({
+            "facts": [], "preferences": [{"slug": "fenced_ok", "value": "yes"}], "corrections": [],
+        }) + "\n```"
+        fenced_result = await extract_and_store(
+            "wrap me in fences", world_ex, _FakeModelRouter(fenced_json), _FakeLLMQueue(),
+        )
+        check("markdown code-fenced JSON is still parsed", fenced_result["method"] == "llm",
+              f"got {fenced_result}")
+
+        # -- Invalid JSON falls back to the regex extractor, not an exception --
+        # Phrased so the regex extractor's actual heuristics (email addresses,
+        # backtick-quoted project names) have something to catch — a bare
+        # single-word name like "Priya" alone doesn't trigger its Title-Case
+        # heuristic, which requires 2+ consecutive capitalized words.
+        invalid_result = await extract_and_store(
+            "Got an email from priya@company.com about the `atlas-core` project.",
+            world_ex, _FakeModelRouter("I don't have that information."), _FakeLLMQueue(),
+        )
+        check("non-JSON model output falls back to regex extraction",
+              invalid_result["method"] == "regex_fallback", f"got {invalid_result}")
+        check("regex fallback still extracts entity mentions",
+              invalid_result.get("entities_extracted", 0) > 0, f"got {invalid_result}")
+
+        # -- A failing background lane call also falls back, doesn't raise --
+        failure_result = await extract_and_store(
+            "Priya mentioned the Atlas rollout again.",
+            world_ex, _FakeModelRouter("irrelevant"), _FailingLLMQueue(),
+        )
+        check("a raising LLMQueue.run_job degrades to regex fallback instead of raising",
+              failure_result["method"] == "regex_fallback", f"got {failure_result}")
+
+        world_ex.close()
         world.close()
 
     print("\n" + "=" * 60)
