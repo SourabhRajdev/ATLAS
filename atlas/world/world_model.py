@@ -189,10 +189,15 @@ class WorldModel:
         now = time.time()
         source_confidence = confidence or SOURCE_RELIABILITY.get(source, 0.6)
 
-        # Find existing attribute for this entity+key+source
+        # Find existing attribute for this entity+key+source. valid_to IS NULL,
+        # not superseded_by IS NULL — valid_to is what idx_attr_current
+        # (schema.py) actually constrains uniqueness on. The two are always
+        # set together by this function, so they agree today, but matching
+        # the real constraint here instead of its usually-equivalent sibling
+        # column keeps that true by construction, not by coincidence.
         existing = self._conn.execute(
             "SELECT * FROM attributes WHERE entity_id = ? AND key = ? AND source = ? "
-            "AND superseded_by IS NULL",
+            "AND valid_to IS NULL",
             (entity_id, key, source),
         ).fetchone()
 
