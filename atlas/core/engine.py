@@ -88,10 +88,13 @@ class Engine:
         trace = TaskState(goal=user_input, session_id=session_id)
         final_response = ""
 
+        # Budget.for_query already picks a coherent (max_tool_calls, max_ms,
+        # max_rounds) triple for this query's size. Only override max_tokens
+        # here — overriding max_ms/max_tool_calls independently (as this used
+        # to) decouples them from max_rounds and silently re-caps real
+        # multi-step tasks at ~10 tool calls regardless of max_rounds.
         budget = Budget.for_query(user_input)
         budget.max_tokens = self.config.max_tokens
-        budget.max_ms = 60_000
-        budget.max_tool_calls = max(budget.max_tool_calls, 10)
 
         # Compress history: verbatim recent turns + compressed older turns
         raw_history = self._session_history.get(session_id, [])

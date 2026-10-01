@@ -67,7 +67,7 @@ class _FakeMemory:
         pass
 
 
-async def _run_executor(responses: list):
+async def _run_executor(responses: list, budget=None):
     from atlas.core.executor import Executor
     from atlas.core.models import Budget
 
@@ -76,7 +76,8 @@ async def _run_executor(responses: list):
     memory = _FakeMemory()
     executor = Executor(model_router=router, config=None, tools=tools, memory=memory, trust=None)
 
-    budget = Budget(max_rounds=len(responses) + 2, max_tool_calls=1000, max_ms=30_000)
+    if budget is None:
+        budget = Budget(max_rounds=len(responses) + 2, max_tool_calls=1000, max_ms=30_000)
     events = []
     async for ev in executor.run("do things", "session-1", budget=budget):
         events.append(ev)
@@ -348,10 +349,171 @@ async def test_bug6_max_rounds_budget_driven() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 1 Brief, Step A.1: max_rounds=40 was cosmetic — max_tool_calls/max_ms
+# were still capped at ~10 tool calls / 60s regardless of max_rounds.
+# --------------------------------------------------------------------------- #
+
+async def test_stepA1_coherent_interactive_budget() -> None:
+    print("\n[A1] Budget's (max_tool_calls, max_ms, max_rounds) are coherent, not independently capped")
+
+    from atlas.core.models import Budget
+
+    # A real multi-step request (not a 5-word trivial query) gets the general
+    # interactive budget, not one of Budget.for_query's trimmed-down cases.
+    budget = Budget.for_query("investigate the failing CI run, find the root cause, and fix it")
+    check(
+        "a real multi-step query gets the general-case budget, not a trimmed one",
+        budget.max_tool_calls == Budget().max_tool_calls,
+        f"got max_tool_calls={budget.max_tool_calls}",
+    )
+    check("max_tool_calls is coherent with max_rounds=40, not re-capped to ~10", budget.max_tool_calls >= 15, f"got {budget.max_tool_calls}")
+    check("max_ms gives enough wall-clock for that many rounds (>= 2 min)", budget.max_ms >= 120_000, f"got {budget.max_ms}")
+
+    # End-to-end: 15 tool calls on the REAL default budget (not a synthetic
+    # test-only budget) must actually complete. Before this fix, Engine's
+    # `budget.max_tool_calls = max(budget.max_tool_calls, 10)` meant this died
+    # at the 10th call no matter how high max_rounds was raised.
+    long_query = (
+        "please investigate why the continuous integration pipeline has been "
+        "failing for the last three days, read through the full logs, identify "
+        "the exact root cause across every affected module, and apply a fix"
+    )
+    responses = [_tool_call_response("step", {"n": i}) for i in range(15)] + [_done_response()]
+    events, tools = await _run_executor(responses, budget=Budget.for_query(long_query))
+    check("15 tool calls complete end-to-end on the real default budget", len(tools.executed) == 15, f"executed={len(tools.executed)}")
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 Brief, Step A.2: alternating/cyclic loops (A,B,A,B,A,B) went
+# undetected by the consecutive-repeat check alone.
+# --------------------------------------------------------------------------- #
+
+async def test_stepA2_cyclic_loop_detection() -> None:
+    print("\n[A2] Alternating loop detection (period-2/3 cycles)")
+
+    from atlas.core.models import EventType
+
+    # Bad: read the same file, "fix" it with the SAME content, 3 times in a
+    # row — a real loop, just alternating instead of a flat repeat.
+    bad_responses = [
+        _tool_call_response("read_file", {"path": "x.py"}),
+        _tool_call_response("write_file", {"path": "x.py", "content": "same content"}),
+        _tool_call_response("read_file", {"path": "x.py"}),
+        _tool_call_response("write_file", {"path": "x.py", "content": "same content"}),
+        _tool_call_response("read_file", {"path": "x.py"}),
+        _tool_call_response("write_file", {"path": "x.py", "content": "same content"}),
+        _done_response(),
+    ]
+    events_bad, tools_bad = await _run_executor(bad_responses)
+    loop_errors_bad = [e for e in events_bad if e.type == EventType.ERROR and "loop detected" in str(e.content)]
+    check("A,B,A,B,A,B with identical args each time is flagged as a loop", len(loop_errors_bad) == 1)
+    check(
+        "the cycle is stopped at the 3rd full period, not left to run forever",
+        len(tools_bad.executed) == 5,
+        f"executed={tools_bad.executed}",
+    )
+
+    # Good: read the file, apply a REAL (different) fix each time, same
+    # read/write shape but never actually repeating — must not be flagged.
+    good_responses = [
+        _tool_call_response("read_file", {"path": "x.py"}),
+        _tool_call_response("write_file", {"path": "x.py", "content": "fix v1"}),
+        _tool_call_response("read_file", {"path": "x.py"}),
+        _tool_call_response("write_file", {"path": "x.py", "content": "fix v2"}),
+        _tool_call_response("read_file", {"path": "x.py"}),
+        _tool_call_response("write_file", {"path": "x.py", "content": "fix v3"}),
+        _done_response(),
+    ]
+    events_good, tools_good = await _run_executor(good_responses)
+    loop_errors_good = [e for e in events_good if e.type == EventType.ERROR and "loop detected" in str(e.content)]
+    check(
+        "re-reading after a genuinely different change each time is not flagged",
+        len(loop_errors_good) == 0,
+        f"errors={[e.content for e in loop_errors_good]}",
+    )
+    check("all 6 calls of the legitimate read/fix cycle executed", len(tools_good.executed) == 6, f"executed={tools_good.executed}")
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 Brief, Step A.3: AttentionSystem called the Gemini client directly,
+# bypassing LLMQueue entirely, so background evaluation could block (and, since
+# the call is a blocking SDK call made with no asyncio.to_thread, truly would
+# have blocked the whole event loop, not just a lane) an interactive request.
+# --------------------------------------------------------------------------- #
+
+async def test_stepA3_attention_through_background_lane() -> None:
+    print("\n[A3] AttentionSystem routes its model call through LLMQueue's background lane")
+
+    from atlas.core.llm_queue import LLMQueue, LANE_INTERACTIVE
+    from atlas.autonomy.attention import AttentionSystem
+    from atlas.autonomy.models import Signal
+
+    class _FakePart:
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeContent:
+        def __init__(self, text):
+            self.parts = [_FakePart(text)]
+
+    class _FakeCandidate:
+        def __init__(self, text):
+            self.content = _FakeContent(text)
+
+    class _FakeResponse:
+        def __init__(self, text):
+            self.candidates = [_FakeCandidate(text)]
+
+    class _FakeModels:
+        def generate_content(self, model, contents, config):
+            time.sleep(0.4)  # simulate a real (blocking, synchronous) SDK call
+            return _FakeResponse(
+                '{"action": "notify", "priority": "low", "confidence": 0.9, "reason": "test"}'
+            )
+
+    class _FakeGenaiClient:
+        def __init__(self):
+            self.models = _FakeModels()
+
+    async def interactive_process_fn(query, session_id, world):
+        return f"handled: {query}", None
+
+    queue = LLMQueue(process_fn=interactive_process_fn)
+    await queue.start()
+    try:
+        config = type("FakeConfig", (), {"model": "fake-model"})()
+        attention = AttentionSystem(config, _FakeGenaiClient(), llm_queue=queue)
+        signal = Signal(source="test", type="suggestion", description="a thing happened")
+
+        attention_task = asyncio.create_task(attention.evaluate_signal(signal))
+        await asyncio.sleep(0.05)  # let it occupy a background worker
+
+        start = time.monotonic()
+        result = await queue.enqueue("urgent question", "s-fg", lane=LANE_INTERACTIVE)
+        elapsed = time.monotonic() - start
+
+        check(
+            "an interactive request isn't blocked by AttentionSystem's background call",
+            elapsed < 0.2,
+            f"elapsed={elapsed:.3f}s (attention call takes 0.4s, and is a blocking call under the hood)",
+        )
+        check("interactive request still got the right answer", result[0] == "handled: urgent question")
+
+        attention_result = await attention_task
+        check(
+            "AttentionSystem still gets a correct result back through the queue",
+            attention_result.action.value == "notify",
+            f"got {attention_result.action}",
+        )
+    finally:
+        queue.stop()
+
+
+# --------------------------------------------------------------------------- #
 
 async def run_tests() -> None:
     print("=" * 60)
-    print("Core System Test Suite (Phase 0 regressions)")
+    print("Core System Test Suite (Phase 0 + Phase 1 Step A regressions)")
     print("=" * 60)
 
     await test_bug1_rag_constructor()
@@ -360,6 +522,9 @@ async def run_tests() -> None:
     test_bug4_parallel_tool_call_ids()
     await test_bug5_loop_detection()
     await test_bug6_max_rounds_budget_driven()
+    await test_stepA1_coherent_interactive_budget()
+    await test_stepA2_cyclic_loop_detection()
+    await test_stepA3_attention_through_background_lane()
 
     print("\n" + "=" * 60)
     total = _PASS + _FAIL

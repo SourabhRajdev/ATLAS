@@ -68,10 +68,13 @@ class _QueueItem:
     priority:   int
     enqueued_at: float
     # non-compared fields
-    query:      str      = field(compare=False)
-    session_id: str      = field(compare=False)
-    world:      str | None = field(compare=False)
-    future:     asyncio.Future = field(compare=False)
+    future:     asyncio.Future = field(compare=False, default=None)
+    query:      str      = field(compare=False, default="")
+    session_id: str      = field(compare=False, default="")
+    world:      str | None = field(compare=False, default=None)
+    # Set instead of (query, session_id, world) for one-off jobs that don't
+    # fit the conversational-turn shape (see LLMQueue.run_job).
+    job_fn:     Callable[[], Awaitable[Any]] | None = field(compare=False, default=None)
 
 
 class LLMQueue:
@@ -184,6 +187,38 @@ class LLMQueue:
         logger.debug("queued [%s] (pri=%d, depth=%d): %s", lane, priority, queue.qsize(), query[:40])
         return await fut
 
+    async def run_job(
+        self,
+        job_fn: Callable[[], Awaitable[Any]],
+        *,
+        priority: Priority = PRIORITY_NORMAL,
+        lane: str = LANE_BACKGROUND,
+        label: str = "job",
+    ) -> Any:
+        """Run a one-off async callable on a lane's worker pool.
+
+        For background model calls that don't fit enqueue()'s conversational
+        (query, session_id, world_summary) -> (response, trace) shape — e.g.
+        AttentionSystem's per-signal classification call. No caching, no
+        dedup (there's no stable query text to key on); the only thing this
+        gives you is the lane's concurrency isolation, which is the point:
+        a slow background job still can't occupy the interactive worker.
+        """
+        if lane not in self._queues:
+            raise ValueError(f"unknown lane: {lane}")
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        item = _QueueItem(
+            priority=priority,
+            enqueued_at=time.time(),
+            future=fut,
+            job_fn=job_fn,
+        )
+        queue = self._queues[lane]
+        await queue.put(item)
+        logger.debug("queued [%s] (pri=%d, depth=%d): job:%s", lane, priority, queue.qsize(), label)
+        return await fut
+
     def stats(self) -> dict:
         total = self._stat_enqueued or 1
         return {
@@ -214,9 +249,28 @@ class LLMQueue:
             except asyncio.CancelledError:
                 return
 
+            wait_s = time.time() - item.enqueued_at
+
+            # One-off job (run_job) — no cache/dedup bookkeeping, just run it
+            # in isolation on this lane's worker.
+            if item.job_fn is not None:
+                if wait_s > 0.1:
+                    logger.debug("queue wait [%s]: %.2fs for job", lane, wait_s)
+                self._stat_llm_calls += 1
+                try:
+                    result = await item.job_fn()
+                    if not item.future.done():
+                        item.future.set_result(result)
+                except Exception as e:
+                    logger.error("background job failed: %s", e)
+                    if not item.future.done():
+                        item.future.set_exception(e)
+                finally:
+                    queue.task_done()
+                continue
+
             key = _cache_key(item.query)
             waiters = self._in_flight.pop(key, [])
-            wait_s = time.time() - item.enqueued_at
 
             if wait_s > 0.1:
                 logger.debug("queue wait [%s]: %.2fs for: %s", lane, wait_s, item.query[:40])

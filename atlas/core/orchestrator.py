@@ -100,6 +100,7 @@ class Orchestrator:
             scheduler=self.scheduler,
             tools=tools,
             client=self.engine.client,
+            llm_queue=self.engine.llm_queue,
         )
 
         # ── New systems ────────────────────────────────────────────────────

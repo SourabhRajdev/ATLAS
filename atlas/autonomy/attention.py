@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -10,6 +11,7 @@ from google.genai import types
 
 from atlas.autonomy.models import ActionDecision, Attention, Priority, Signal
 from atlas.config import Settings
+from atlas.core.llm_queue import LANE_BACKGROUND, LLMQueue
 
 logger = logging.getLogger("atlas.attention")
 
@@ -47,14 +49,19 @@ Output JSON:
 
 class AttentionSystem:
     """Decides what signals need attention and how to handle them."""
-    
-    def __init__(self, config: Settings, client: genai.Client) -> None:
+
+    def __init__(self, config: Settings, client: genai.Client, llm_queue: LLMQueue | None = None) -> None:
         self.config = config
         self.client = client
+        # Routes the actual model call through the background lane so a
+        # slow attention evaluation can never occupy the interactive
+        # worker an in-flight user request is waiting on. Optional only so
+        # AttentionSystem stays unit-testable without a full LLMQueue.
+        self.llm_queue = llm_queue
 
     async def evaluate_signal(self, signal: Signal) -> Attention:
         """Evaluate a signal and decide what to do."""
-        
+
         # Build prompt
         signal_desc = f"""
 Type: {signal.type}
@@ -62,11 +69,11 @@ Source: {signal.source}
 Description: {signal.description}
 Data: {signal.data}
 """
-        
+
         prompt = ATTENTION_PROMPT.format(signal=signal_desc)
-        
-        try:
-            response = self.client.models.generate_content(
+
+        def _call_sync():
+            return self.client.models.generate_content(
                 model=self.config.model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -74,7 +81,21 @@ Data: {signal.data}
                     response_mime_type="application/json",
                 )
             )
-            
+
+        async def _call():
+            # The genai SDK call is synchronous/blocking — run it off the
+            # event loop thread so it can't stall other coroutines
+            # (including, if this weren't lane-isolated, the interactive one).
+            return await asyncio.to_thread(_call_sync)
+
+        try:
+            if self.llm_queue is not None:
+                response = await self.llm_queue.run_job(
+                    _call, lane=LANE_BACKGROUND, label="attention_evaluate",
+                )
+            else:
+                response = await _call()
+
             if not response.candidates:
                 return self._fallback_attention(signal)
             
